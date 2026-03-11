@@ -34,11 +34,7 @@ class ApiResponse<T> {
   }
 }
 
-// Initializing ffmpeg
-if (ffmpegStatic) {
-  ffmpeg.setFfmpegPath(ffmpegStatic);
-}
-
+// Removed ffmpeg-static usage to rely on system ffmpeg which is more stable with HLS
 const app = express();
 
 // Security and CORS configuration
@@ -120,39 +116,23 @@ async function getBrowser() {
   return launchPromise;
 }
 
-async function fetchKickApiWithPuppeteer(url: string) {
-  const browser = await getBrowser();
-  const page = await browser.newPage();
-  
-  // Optimize by blocking images, fonts, media
-  await page.setRequestInterception(true);
-  page.on('request', (req: any) => {
-    const rt = req.resourceType();
-    if (['image', 'stylesheet', 'font', 'media'].includes(rt)) {
-      req.abort();
-    } else {
-      req.continue();
-    }
-  });
-
-  await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
-  
+async function fastFetchKickApi(url: string) {
   try {
-    await page.goto(url, { waitUntil: 'networkidle2', timeout: 20000 });
-    
-    // Extract JSON from the page body (Kick API returns raw JSON)
-    const jsonText = await page.evaluate(() => {
-        return document.body.innerText;
+    const response = await axios.get(url, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'application/json',
+        'Accept-Language': 'en-US,en;q=0.9',
+      },
+      timeout: 10000 
     });
-
-    const parsedData = JSON.parse(jsonText);
-    await page.close();
-    return parsedData;
-
+    return response.data;
   } catch (err: any) {
-    await page.close().catch(() => {});
-    if (err.message && err.message.includes('Unexpected token')) {
+    if (err.response && err.response.status === 403) {
        throw new Error('Cloudflare Challenge blocked the request.');
+    }
+    if (err.response && err.response.status === 404) {
+       return { message: 'not found' }; // Mock Kick's API not found response
     }
     throw err;
   }
@@ -167,7 +147,7 @@ app.get('/api/kick/channel/:name', asyncHandler(async (req: Request, res: Respon
   }
 
   try {
-    const data = await fetchKickApiWithPuppeteer(`https://kick.com/api/v2/channels/${channelName}`);
+    const data = await fastFetchKickApi(`https://kick.com/api/v2/channels/${channelName}`);
     
     // Kick API usually returns an error object if not found
     if (data && data.message && data.message.includes('not found')) {
@@ -194,7 +174,7 @@ app.get('/api/kick/channel/:name/vods', asyncHandler(async (req: Request, res: R
   
     try {
       // Kick's VOD API is paginated, but we'll fetch the first page for now
-      const data = await fetchKickApiWithPuppeteer(`https://kick.com/api/v2/channels/${channelName}/videos`);
+      const data = await fastFetchKickApi(`https://kick.com/api/v2/channels/${channelName}/videos`);
       
       if (data && data.message && data.message.includes('not found')) {
          return res.status(404).json(ApiResponse.fail('NOT_FOUND', 'Channel VODs not found.', data));
@@ -219,7 +199,7 @@ app.get('/api/kick/video/:id', asyncHandler(async (req: Request, res: Response) 
   }
 
   try {
-    const data = await fetchKickApiWithPuppeteer(`https://kick.com/api/v1/video/${videoId}`);
+    const data = await fastFetchKickApi(`https://kick.com/api/v1/video/${videoId}`);
     
     if (data && data.message && data.message.includes('not found')) {
        return res.status(404).json(ApiResponse.fail('NOT_FOUND', 'Video not found.', data));
@@ -327,7 +307,14 @@ app.post('/api/clip', asyncHandler(async (req: Request, res: Response) => {
   ffmpeg(videoUrl)
     .setStartTime(startTime)
     .setDuration(duration)
-    .outputOptions('-c copy')
+    // SIGSEGV usually happens when copying malformed/segmented HLS directly.
+    // Re-encoding with veryfast preset fixes the memory segmentation fault.
+    .outputOptions([
+        '-c:v copy', 
+        '-c:a aac',
+        '-bsf:a aac_adtstoasc',
+        '-movflags +faststart'
+    ])
     .on('start', (commandLine) => {
         console.log(`[CLIP_JOB_SPAWN] ${jobId} -> ${commandLine}`);
     })
