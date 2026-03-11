@@ -128,6 +128,32 @@ app.get('/api/kick/channel/:name', asyncHandler(async (req: Request, res: Respon
   }
 }));
 
+// API Route: Get Channel VODs
+app.get('/api/kick/channel/:name/vods', asyncHandler(async (req: Request, res: Response) => {
+    const channelName = req.params.name;
+    
+    if (!channelName || typeof channelName !== 'string') {
+      return res.status(400).json(ApiResponse.fail('VALIDATION_ERROR', 'Channel name is required and must be a string.'));
+    }
+  
+    try {
+      // Kick's VOD API is paginated, but we'll fetch the first page for now
+      const data = await fetchKickApiWithPuppeteer(`https://kick.com/api/v2/channels/${channelName}/videos`);
+      
+      if (data && data.message && data.message.includes('not found')) {
+         return res.status(404).json(ApiResponse.fail('NOT_FOUND', 'Channel VODs not found.', data));
+      }
+  
+      return res.status(200).json(ApiResponse.success(data));
+    } catch (error: any) {
+      console.error('Error fetching VOD data:', error.message);
+      if (error.message.includes('Cloudflare')) {
+          return res.status(403).json(ApiResponse.fail('FORBIDDEN', 'Request blocked by Cloudflare.', error.message));
+      }
+      return res.status(502).json(ApiResponse.fail('BAD_GATEWAY', 'Failed to communicate with Kick API.', error.message));
+    }
+  }));
+
 // API Route: Get Video Info
 app.get('/api/kick/video/:id', asyncHandler(async (req: Request, res: Response) => {
   const videoId = req.params.id;
