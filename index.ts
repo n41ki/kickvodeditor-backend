@@ -43,21 +43,33 @@ const app = express();
 
 // Security and CORS configuration
 app.use(cors({
-  origin: '*', // For production, this should ideally be restricted
-  methods: ['GET', 'POST'],
+  // Using an array to allow both local development and Vercel/production domains
+  // In a real production scenario, you'd want to restrict this to just your Vercel URL
+  origin: process.env.CORS_ORIGIN ? process.env.CORS_ORIGIN.split(',') : '*', 
+  methods: ['GET', 'POST', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization']
 }));
 
 // Payload parsing
 app.use(express.json({ limit: '10mb' }));
 
-const PORT = process.env.PORT || 3001;
+const PORT = process.env.PORT || 3000;
 
-// Directory setup for clips
 const CLIPS_DIR = path.join(__dirname, 'clips');
 if (!fs.existsSync(CLIPS_DIR)) {
   fs.mkdirSync(CLIPS_DIR, { recursive: true });
 }
+
+interface ClipJob {
+  id: string;
+  progress: number;
+  status: 'processing' | 'completed' | 'error';
+  url?: string;
+  filename?: string;
+  error?: string;
+}
+
+const clipJobs = new Map<string, ClipJob>();
 
 // Statically serving generated clips
 app.use('/clips', express.static(CLIPS_DIR));
@@ -255,38 +267,82 @@ app.post('/api/clip', asyncHandler(async (req: Request, res: Response) => {
 
   const outputFilename = `clip-${Date.now()}-${Math.floor(Math.random() * 1000)}.mp4`;
   const outputPath = path.join(CLIPS_DIR, outputFilename);
+  const jobId = Date.now().toString();
 
-  console.log(`[CLIP_JOB_START] Filename: ${outputFilename} | Duration: ${duration}s | Start: ${startTime}s`);
+  console.log(`[CLIP_JOB_START] Job: ${jobId} | Filename: ${outputFilename} | Duration: ${duration}s | Start: ${startTime}s`);
 
-  // We do not await this, we listen for events. Since we want an HTTP response we wait for 'end'
-  // For long processing >30s on Serverless/Render, WebSockets or polling is recommended.
-  // Because 'fluent-ffmpeg' allows '-c copy', it's extremely fast and usually completes within HTTP timeout.
+  clipJobs.set(jobId, {
+     id: jobId,
+     progress: 0,
+     status: 'processing'
+  });
+
+  // Return immediately
+  res.status(200).json(ApiResponse.success({ jobId }));
   
   ffmpeg(videoUrl)
     .setStartTime(startTime)
     .setDuration(duration)
     .outputOptions('-c copy')
     .on('start', (commandLine) => {
-        console.log(`[CLIP_JOB_SPAWN] ${commandLine}`);
+        console.log(`[CLIP_JOB_SPAWN] ${jobId} -> ${commandLine}`);
+    })
+    .on('progress', (progress) => {
+        // fluent-ffmpeg progress.percent might be undefined if total length isn't perfectly known, 
+        // but often works. If undefined, we mock progress or stick to 50%.
+        const job = clipJobs.get(jobId);
+        if (job) {
+            let p = progress.percent;
+            if (p === undefined || isNaN(p)) {
+                 // Try parsing timemark (e.g. 00:00:05.12)
+                 if (progress.timemark) {
+                    const parts = progress.timemark.split(':');
+                    if (parts.length === 3) {
+                       const currentSec = parseFloat(parts[0]) * 3600 + parseFloat(parts[1]) * 60 + parseFloat(parts[2]);
+                       p = (currentSec / duration) * 100;
+                    }
+                 } else {
+                    p = 50; 
+                 }
+            }
+            job.progress = Math.min(Math.max(p || 50, 0), 99); 
+            clipJobs.set(jobId, job);
+        }
     })
     .on('end', () => {
-      console.log(`[CLIP_JOB_SUCCESS] ${outputFilename}`);
-      return res.status(200).json(ApiResponse.success({
-        clipUrl: `/clips/${outputFilename}`,
-        filename: outputFilename,
-        expiresIn: 'Ephemeral storage, clip may be deleted on next deploy/restart.',
-      }));
+      console.log(`[CLIP_JOB_SUCCESS] ${jobId} -> ${outputFilename}`);
+      const job = clipJobs.get(jobId);
+      if (job) {
+          job.progress = 100;
+          job.status = 'completed';
+          job.url = `/clips/${outputFilename}`;
+          job.filename = outputFilename;
+          clipJobs.set(jobId, job);
+      }
     })
     .on('error', (err: any) => {
-      console.error(`[CLIP_JOB_ERROR]`, err.message);
-      
-      // If headers are not sent yet, return 500
-      if (!res.headersSent) {
-          return res.status(500).json(ApiResponse.fail('PROCESSING_ERROR', 'An error occurred while generating the clip.', err.message));
+      console.error(`[CLIP_JOB_ERROR] ${jobId}`, err.message);
+      const job = clipJobs.get(jobId);
+      if (job) {
+          job.status = 'error';
+          job.error = err.message;
+          clipJobs.set(jobId, job);
       }
     })
     .save(outputPath);
 }));
+
+// API Route: Get Clip Job Status
+app.get('/api/clip/:id', (req: Request, res: Response) => {
+    const jobId = req.params.id;
+    const job = clipJobs.get(jobId);
+    
+    if (!job) {
+        return res.status(404).json(ApiResponse.fail('NOT_FOUND', 'Clip job not found.'));
+    }
+
+    return res.status(200).json(ApiResponse.success(job));
+});
 
 // Global Error Handler
 app.use((err: Error, req: Request, res: Response, next: NextFunction) => {
