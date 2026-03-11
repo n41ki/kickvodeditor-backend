@@ -84,11 +84,22 @@ const asyncHandler = (fn: Function) => (req: Request, res: Response, next: NextF
   Promise.resolve(fn(req, res, next)).catch(next);
 };
 
-// Helper function to fetch Kick API endpoints via Puppeteer
 async function fetchKickApiWithPuppeteer(url: string) {
+  const isDocker = process.env.RENDER || fs.existsSync('/.dockerenv');
+  
   const browser = await puppeteer.launch({
     headless: true,
-    args: ['--no-sandbox', '--disable-setuid-sandbox']
+    executablePath: isDocker ? '/usr/bin/google-chrome' : undefined,
+    args: [
+      '--no-sandbox', 
+      '--disable-setuid-sandbox',
+      '--disable-dev-shm-usage',
+      '--disable-accelerated-2d-canvas',
+      '--no-first-run',
+      '--no-zygote',
+      '--single-process',
+      '--disable-gpu'
+    ]
   });
   const page = await browser.newPage();
   await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
