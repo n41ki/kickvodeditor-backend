@@ -116,23 +116,40 @@ async function getBrowser() {
   return launchPromise;
 }
 
-async function fastFetchKickApi(url: string) {
-  try {
-    const response = await axios.get(url, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Accept': 'application/json',
-        'Accept-Language': 'en-US,en;q=0.9',
-      },
-      timeout: 10000 
-    });
-    return response.data;
-  } catch (err: any) {
-    if (err.response && err.response.status === 403) {
-       throw new Error('Cloudflare Challenge blocked the request.');
+async function fetchKickApiWithPuppeteer(url: string) {
+  const browser = await getBrowser();
+  const page = await browser.newPage();
+  
+  // Optimize by blocking images, fonts, media, and third-party scripts
+  await page.setRequestInterception(true);
+  page.on('request', (req: any) => {
+    const rt = req.resourceType();
+    if (['image', 'stylesheet', 'font', 'media', 'other'].includes(rt)) {
+      req.abort();
+    } else {
+      req.continue();
     }
-    if (err.response && err.response.status === 404) {
-       return { message: 'not found' }; // Mock Kick's API not found response
+  });
+
+  await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
+  
+  try {
+    // We only wait for 'domcontentloaded' which is much faster than 'networkidle2'
+    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 15000 });
+    
+    // Extract JSON from the page body
+    const jsonText = await page.evaluate(() => {
+        return document.body.innerText;
+    });
+
+    const parsedData = JSON.parse(jsonText);
+    await page.close();
+    return parsedData;
+
+  } catch (err: any) {
+    await page.close().catch(() => {});
+    if (err.message && err.message.includes('Unexpected token')) {
+       throw new Error('Cloudflare Challenge blocked the request.');
     }
     throw err;
   }
@@ -147,7 +164,7 @@ app.get('/api/kick/channel/:name', asyncHandler(async (req: Request, res: Respon
   }
 
   try {
-    const data = await fastFetchKickApi(`https://kick.com/api/v2/channels/${channelName}`);
+    const data = await fetchKickApiWithPuppeteer(`https://kick.com/api/v2/channels/${channelName}`);
     
     // Kick API usually returns an error object if not found
     if (data && data.message && data.message.includes('not found')) {
@@ -174,7 +191,7 @@ app.get('/api/kick/channel/:name/vods', asyncHandler(async (req: Request, res: R
   
     try {
       // Kick's VOD API is paginated, but we'll fetch the first page for now
-      const data = await fastFetchKickApi(`https://kick.com/api/v2/channels/${channelName}/videos`);
+      const data = await fetchKickApiWithPuppeteer(`https://kick.com/api/v2/channels/${channelName}/videos`);
       
       if (data && data.message && data.message.includes('not found')) {
          return res.status(404).json(ApiResponse.fail('NOT_FOUND', 'Channel VODs not found.', data));
@@ -199,7 +216,7 @@ app.get('/api/kick/video/:id', asyncHandler(async (req: Request, res: Response) 
   }
 
   try {
-    const data = await fastFetchKickApi(`https://kick.com/api/v1/video/${videoId}`);
+    const data = await fetchKickApiWithPuppeteer(`https://kick.com/api/v1/video/${videoId}`);
     
     if (data && data.message && data.message.includes('not found')) {
        return res.status(404).json(ApiResponse.fail('NOT_FOUND', 'Video not found.', data));
