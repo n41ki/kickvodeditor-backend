@@ -44,8 +44,8 @@ const app = express();
 // Security and CORS configuration
 app.use(cors({
   // Using an array to allow both local development and Vercel/production domains
-  // In a real production scenario, you'd want to restrict this to just your Vercel URL
-  origin: process.env.CORS_ORIGIN ? process.env.CORS_ORIGIN.split(',') : '*', 
+  // Allows "*" to correctly act as a wildcard, otherwise splits the comma-separated domains
+  origin: process.env.CORS_ORIGIN === '*' ? '*' : (process.env.CORS_ORIGIN ? process.env.CORS_ORIGIN.split(',') : '*'), 
   methods: ['GET', 'POST', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization']
 }));
