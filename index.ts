@@ -1,4 +1,4 @@
-import express, { Request, Response } from 'express';
+import express, { Request, Response, NextFunction } from 'express';
 import cors from 'cors';
 import axios from 'axios';
 import ffmpeg from 'fluent-ffmpeg';
@@ -6,103 +6,176 @@ import ffmpegStatic from 'ffmpeg-static';
 import path from 'path';
 import fs from 'fs';
 
-// Set the path to the ffmpeg static binary
+// @api-design-principles: Standard API format wrapper classes
+class ApiResponse<T> {
+  success: boolean;
+  data?: T;
+  error?: { code: string; message: string; details?: any };
+
+  constructor(success: boolean, data?: T, error?: { code: string; message: string; details?: any }) {
+    this.success = success;
+    if (data !== undefined) this.data = data;
+    if (error !== undefined) this.error = error;
+  }
+
+  static success<T>(data: T) {
+    return new ApiResponse<T>(true, data);
+  }
+
+  static fail(code: string, message: string, details?: any) {
+    return new ApiResponse<any>(false, undefined, { code, message, details });
+  }
+}
+
+// Initializing ffmpeg
 if (ffmpegStatic) {
   ffmpeg.setFfmpegPath(ffmpegStatic);
 }
 
 const app = express();
-// Enable CORS for all origins so the frontend can communicate with it
-app.use(cors());
-app.use(express.json());
+
+// Security and CORS configuration
+app.use(cors({
+  origin: '*', // For production, this should ideally be restricted
+  methods: ['GET', 'POST'],
+  allowedHeaders: ['Content-Type', 'Authorization']
+}));
+
+// Payload parsing
+app.use(express.json({ limit: '10mb' }));
 
 const PORT = process.env.PORT || 3001;
 
-// Temp folder for clips. Render uses ephemeral storage, which is fine for temporary clips.
+// Directory setup for clips
 const CLIPS_DIR = path.join(__dirname, 'clips');
 if (!fs.existsSync(CLIPS_DIR)) {
   fs.mkdirSync(CLIPS_DIR, { recursive: true });
 }
 
-// Serve the clips folder statically so the frontend can download them
+// Statically serving generated clips
 app.use('/clips', express.static(CLIPS_DIR));
 
+// Healthcheck Route
 app.get('/', (req, res) => {
-  res.send('Kick VOD Editor Backend is running.');
+  res.status(200).json(ApiResponse.success({ status: 'healthy', version: '1.0.0' }));
 });
 
-// Proxy to fetch Kick channel information (bypassing CORS)
-app.get('/api/kick/channel/:name', async (req: Request, res: Response) => {
+// @api-design-principles: Robust Error handling wrapper for async routes
+const asyncHandler = (fn: Function) => (req: Request, res: Response, next: NextFunction) => {
+  Promise.resolve(fn(req, res, next)).catch(next);
+};
+
+// API Route: Get Channel Info
+app.get('/api/kick/channel/:name', asyncHandler(async (req: Request, res: Response) => {
+  const channelName = req.params.name;
+  
+  if (!channelName || typeof channelName !== 'string') {
+    return res.status(400).json(ApiResponse.fail('VALIDATION_ERROR', 'Channel name is required and must be a string.'));
+  }
+
   try {
-    const channelName = req.params.name;
-    const response = await axios.get(`https://kick.com/api/v2/channels/${channelName}`);
-    res.json(response.data);
+    const response = await axios.get(`https://kick.com/api/v2/channels/${channelName}`, {
+      headers: {
+        'Accept': 'application/json',
+      }
+    });
+    
+    // Kick API returns 404 for non-existent channels, axios throws error. 
+    return res.status(200).json(ApiResponse.success(response.data));
   } catch (error: any) {
+    if (error.response && error.response.status === 404) {
+      return res.status(404).json(ApiResponse.fail('NOT_FOUND', 'Channel not found.', error.response.data));
+    }
     console.error('Error fetching channel data:', error.message);
-    res.status(500).json({ error: 'Error fetching Kick channel', details: error.message });
+    return res.status(502).json(ApiResponse.fail('BAD_GATEWAY', 'Failed to communicate with Kick API.', error.message));
   }
-});
+}));
 
-// Proxy to fetch specific Kick VOD/Video information (bypassing CORS)
-app.get('/api/kick/video/:id', async (req: Request, res: Response) => {
+// API Route: Get Video Info
+app.get('/api/kick/video/:id', asyncHandler(async (req: Request, res: Response) => {
+  const videoId = req.params.id;
+
+  if (!videoId || typeof videoId !== 'string') {
+    return res.status(400).json(ApiResponse.fail('VALIDATION_ERROR', 'Video ID is required and must be a string.'));
+  }
+
   try {
-    const videoId = req.params.id;
     const response = await axios.get(`https://kick.com/api/v1/video/${videoId}`);
-    res.json(response.data);
+    return res.status(200).json(ApiResponse.success(response.data));
   } catch (error: any) {
+    if (error.response && error.response.status === 404) {
+      return res.status(404).json(ApiResponse.fail('NOT_FOUND', 'Video not found.', error.response.data));
+    }
     console.error('Error fetching video data:', error.message);
-    res.status(500).json({ error: 'Error fetching Kick video', details: error.message });
+    return res.status(502).json(ApiResponse.fail('BAD_GATEWAY', 'Failed to communicate with Kick API.', error.message));
   }
+}));
+
+// API Route: Generate Clip
+app.post('/api/clip', asyncHandler(async (req: Request, res: Response) => {
+  const { videoUrl, startTime, duration } = req.body;
+
+  // Input Validation
+  if (!videoUrl || typeof videoUrl !== 'string') {
+    return res.status(400).json(ApiResponse.fail('VALIDATION_ERROR', 'videoUrl is required and must be a string.'));
+  }
+  if (startTime === undefined || typeof startTime !== 'number' || startTime < 0) {
+    return res.status(400).json(ApiResponse.fail('VALIDATION_ERROR', 'startTime is required and must be a positive number.'));
+  }
+  if (!duration || typeof duration !== 'number') {
+    return res.status(400).json(ApiResponse.fail('VALIDATION_ERROR', 'duration is required and must be a number.'));
+  }
+  // Enforcing strict clip limits
+  if (duration < 5 || duration > 1200) {
+    return res.status(400).json(ApiResponse.fail('VALIDATION_ERROR', 'Duration must be between 5 seconds and 20 minutes (1200 seconds).'));
+  }
+
+  const outputFilename = `clip-${Date.now()}-${Math.floor(Math.random() * 1000)}.mp4`;
+  const outputPath = path.join(CLIPS_DIR, outputFilename);
+
+  console.log(`[CLIP_JOB_START] Filename: ${outputFilename} | Duration: ${duration}s | Start: ${startTime}s`);
+
+  // We do not await this, we listen for events. Since we want an HTTP response we wait for 'end'
+  // For long processing >30s on Serverless/Render, WebSockets or polling is recommended.
+  // Because 'fluent-ffmpeg' allows '-c copy', it's extremely fast and usually completes within HTTP timeout.
+  
+  ffmpeg(videoUrl)
+    .setStartTime(startTime)
+    .setDuration(duration)
+    .outputOptions('-c copy')
+    .on('start', (commandLine) => {
+        console.log(`[CLIP_JOB_SPAWN] ${commandLine}`);
+    })
+    .on('end', () => {
+      console.log(`[CLIP_JOB_SUCCESS] ${outputFilename}`);
+      return res.status(200).json(ApiResponse.success({
+        clipUrl: `/clips/${outputFilename}`,
+        filename: outputFilename,
+        expiresIn: 'Ephemeral storage, clip may be deleted on next deploy/restart.',
+      }));
+    })
+    .on('error', (err: any) => {
+      console.error(`[CLIP_JOB_ERROR]`, err.message);
+      
+      // If headers are not sent yet, return 500
+      if (!res.headersSent) {
+          return res.status(500).json(ApiResponse.fail('PROCESSING_ERROR', 'An error occurred while generating the clip.', err.message));
+      }
+    })
+    .save(outputPath);
+}));
+
+// Global Error Handler
+app.use((err: Error, req: Request, res: Response, next: NextFunction) => {
+  console.error('[UNHANDLED_ERROR]', err);
+  res.status(500).json(ApiResponse.fail('INTERNAL_SERVER_ERROR', 'An unexpected error occurred.', err.message));
 });
 
-// Endpoint to generate a clip using FFmpeg
-app.post('/api/clip', async (req: Request, res: Response) => {
-  try {
-    const { videoUrl, startTime, duration } = req.body;
-
-    if (!videoUrl || startTime === undefined || !duration) {
-      return res.status(400).json({ error: 'Missing parameters: videoUrl, startTime, duration' });
-    }
-
-    if (duration < 5 || duration > 1200) {
-      return res.status(400).json({ error: 'Duration must be between 5 seconds and 20 minutes (1200 seconds)' });
-    }
-
-    const outputFilename = `clip-${Date.now()}.mp4`;
-    const outputPath = path.join(CLIPS_DIR, outputFilename);
-
-    console.log(`Starting FFmpeg clip generation: ${outputFilename} (Duration: ${duration}s)`);
-
-    // Using fluent-ffmpeg to process the m3u8 stream and extract a specific segment.
-    // '-c copy' is extremely fast because it copies the streams instead of re-encoding.
-    ffmpeg(videoUrl)
-      .setStartTime(startTime)
-      .setDuration(duration)
-      .outputOptions('-c copy') 
-      .on('start', (commandLine) => {
-        console.log('Spawned FFmpeg with command: ' + commandLine);
-      })
-      .on('end', () => {
-        console.log(`Finished processing: ${outputFilename}`);
-        res.json({
-          success: true,
-          // Build absolute URL for Render if needed, but relative should be fine with the base URL setup on frontend
-          clipUrl: `/clips/${outputFilename}`,
-          filename: outputFilename
-        });
-      })
-      .on('error', (err: any) => {
-        console.error('FFmpeg Error:', err.message);
-        res.status(500).json({ error: 'FFmpeg processing failed', details: err.message });
-      })
-      .save(outputPath);
-      
-  } catch (error: any) {
-    console.error('Server error during clipping:', error.message);
-    res.status(500).json({ error: 'Server error during clipping', details: error.message });
-  }
+// 404 Handler
+app.use((req: Request, res: Response) => {
+  res.status(404).json(ApiResponse.fail('ROUTE_NOT_FOUND', 'The requested endpoint does not exist.'));
 });
 
 app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
+  console.log(`[SERVER_START] Listening on port ${PORT}`);
 });
