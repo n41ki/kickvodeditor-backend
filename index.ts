@@ -84,28 +84,61 @@ const asyncHandler = (fn: Function) => (req: Request, res: Response, next: NextF
   Promise.resolve(fn(req, res, next)).catch(next);
 };
 
+let globalBrowser: any = null;
+let launchPromise: Promise<any> | null = null;
+
+async function getBrowser() {
+  if (globalBrowser) return globalBrowser;
+  if (launchPromise) return launchPromise;
+
+  launchPromise = (async () => {
+    const isDocker = process.env.RENDER || fs.existsSync('/.dockerenv');
+    const browser = await puppeteer.launch({
+      headless: true,
+      executablePath: isDocker ? '/usr/bin/google-chrome' : undefined,
+      args: [
+        '--no-sandbox', 
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-accelerated-2d-canvas',
+        '--no-first-run',
+        '--no-zygote',
+        '--single-process',
+        '--disable-gpu'
+      ]
+    });
+    
+    browser.on('disconnected', () => {
+      globalBrowser = null;
+      launchPromise = null;
+    });
+    
+    globalBrowser = browser;
+    return browser;
+  })();
+
+  return launchPromise;
+}
+
 async function fetchKickApiWithPuppeteer(url: string) {
-  const isDocker = process.env.RENDER || fs.existsSync('/.dockerenv');
-  
-  const browser = await puppeteer.launch({
-    headless: true,
-    executablePath: isDocker ? '/usr/bin/google-chrome' : undefined,
-    args: [
-      '--no-sandbox', 
-      '--disable-setuid-sandbox',
-      '--disable-dev-shm-usage',
-      '--disable-accelerated-2d-canvas',
-      '--no-first-run',
-      '--no-zygote',
-      '--single-process',
-      '--disable-gpu'
-    ]
-  });
+  const browser = await getBrowser();
   const page = await browser.newPage();
+  
+  // Optimize by blocking images, fonts, media
+  await page.setRequestInterception(true);
+  page.on('request', (req: any) => {
+    const rt = req.resourceType();
+    if (['image', 'stylesheet', 'font', 'media'].includes(rt)) {
+      req.abort();
+    } else {
+      req.continue();
+    }
+  });
+
   await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
   
   try {
-    await page.goto(url, { waitUntil: 'networkidle2' });
+    await page.goto(url, { waitUntil: 'networkidle2', timeout: 20000 });
     
     // Extract JSON from the page body (Kick API returns raw JSON)
     const jsonText = await page.evaluate(() => {
@@ -113,12 +146,12 @@ async function fetchKickApiWithPuppeteer(url: string) {
     });
 
     const parsedData = JSON.parse(jsonText);
-    await browser.close();
+    await page.close();
     return parsedData;
 
   } catch (err: any) {
-    await browser.close();
-    if (err.message.includes('Unexpected token')) {
+    await page.close().catch(() => {});
+    if (err.message && err.message.includes('Unexpected token')) {
        throw new Error('Cloudflare Challenge blocked the request.');
     }
     throw err;
@@ -365,6 +398,18 @@ app.use((err: Error, req: Request, res: Response, next: NextFunction) => {
 app.use((req: Request, res: Response) => {
   res.status(404).json(ApiResponse.fail('ROUTE_NOT_FOUND', 'The requested endpoint does not exist.'));
 });
+
+// Self-ping to keep alive on Render free tier
+const RENDER_EXTERNAL_URL = process.env.RENDER_EXTERNAL_URL;
+if (RENDER_EXTERNAL_URL) {
+  setInterval(() => {
+    axios.get(RENDER_EXTERNAL_URL).then(() => {
+      console.log(`[KEEP_ALIVE] Pinged ${RENDER_EXTERNAL_URL} to prevent sleep`);
+    }).catch((err) => {
+      console.error(`[KEEP_ALIVE] Failed to ping ${RENDER_EXTERNAL_URL}:`, err.message);
+    });
+  }, 14 * 60 * 1000); // 14 minutes
+}
 
 app.listen(PORT, () => {
   console.log(`[SERVER_START] Listening on port ${PORT}`);
