@@ -1,5 +1,6 @@
 import express, { Request, Response, NextFunction } from 'express';
 import cors from 'cors';
+import axios from 'axios';
 import ffmpeg from 'fluent-ffmpeg';
 import ffmpegStatic from 'ffmpeg-static';
 import path from 'path';
@@ -150,6 +151,40 @@ app.get('/api/kick/video/:id', asyncHandler(async (req: Request, res: Response) 
     }
     return res.status(502).json(ApiResponse.fail('BAD_GATEWAY', 'Failed to communicate with Kick API.', error.message));
   }
+}));
+
+// API Route: HLS Stream Proxy
+// To bypass direct CORS blocks from the browser to Kick's video servers
+app.get('/api/kick/stream', asyncHandler(async (req: Request, res: Response) => {
+    const streamUrl = req.query.url as string;
+    
+    if (!streamUrl) {
+       return res.status(400).send('Missing stream URL');
+    }
+
+    try {
+       const response = await axios({
+           method: 'GET',
+           url: streamUrl,
+           responseType: 'stream',
+           headers: {
+               'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+               'Referer': 'https://kick.com',
+               'Origin': 'https://kick.com',
+           }
+       });
+
+       // Copy content type (usually application/vnd.apple.mpegurl or video/mp2t)
+       if (response.headers['content-type']) {
+           res.setHeader('Content-Type', response.headers['content-type']);
+       }
+       res.setHeader('Access-Control-Allow-Origin', '*');
+
+       response.data.pipe(res);
+    } catch (error: any) {
+       console.error('[Stream Proxy Error]', error.message);
+       res.status(502).send('Failed to proxy stream');
+    }
 }));
 
 // API Route: Generate Clip
