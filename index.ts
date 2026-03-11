@@ -1,10 +1,16 @@
 import express, { Request, Response, NextFunction } from 'express';
 import cors from 'cors';
-import axios from 'axios';
 import ffmpeg from 'fluent-ffmpeg';
 import ffmpegStatic from 'ffmpeg-static';
 import path from 'path';
 import fs from 'fs';
+import puppeteer from 'puppeteer-extra';
+import StealthPlugin from 'puppeteer-extra-plugin-stealth';
+
+// Add stealth plugin to bypass Cloudflare
+puppeteer.use(StealthPlugin());
+
+// ... (other imports stay the same)
 
 // @api-design-principles: Standard API format wrapper classes
 class ApiResponse<T> {
@@ -65,6 +71,36 @@ const asyncHandler = (fn: Function) => (req: Request, res: Response, next: NextF
   Promise.resolve(fn(req, res, next)).catch(next);
 };
 
+// Helper function to fetch Kick API endpoints via Puppeteer
+async function fetchKickApiWithPuppeteer(url: string) {
+  const browser = await puppeteer.launch({
+    headless: true,
+    args: ['--no-sandbox', '--disable-setuid-sandbox']
+  });
+  const page = await browser.newPage();
+  await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
+  
+  try {
+    await page.goto(url, { waitUntil: 'networkidle2' });
+    
+    // Extract JSON from the page body (Kick API returns raw JSON)
+    const jsonText = await page.evaluate(() => {
+        return document.body.innerText;
+    });
+
+    const parsedData = JSON.parse(jsonText);
+    await browser.close();
+    return parsedData;
+
+  } catch (err: any) {
+    await browser.close();
+    if (err.message.includes('Unexpected token')) {
+       throw new Error('Cloudflare Challenge blocked the request.');
+    }
+    throw err;
+  }
+}
+
 // API Route: Get Channel Info
 app.get('/api/kick/channel/:name', asyncHandler(async (req: Request, res: Response) => {
   const channelName = req.params.name;
@@ -74,19 +110,19 @@ app.get('/api/kick/channel/:name', asyncHandler(async (req: Request, res: Respon
   }
 
   try {
-    const response = await axios.get(`https://kick.com/api/v2/channels/${channelName}`, {
-      headers: {
-        'Accept': 'application/json',
-      }
-    });
+    const data = await fetchKickApiWithPuppeteer(`https://kick.com/api/v2/channels/${channelName}`);
     
-    // Kick API returns 404 for non-existent channels, axios throws error. 
-    return res.status(200).json(ApiResponse.success(response.data));
-  } catch (error: any) {
-    if (error.response && error.response.status === 404) {
-      return res.status(404).json(ApiResponse.fail('NOT_FOUND', 'Channel not found.', error.response.data));
+    // Kick API usually returns an error object if not found
+    if (data && data.message && data.message.includes('not found')) {
+       return res.status(404).json(ApiResponse.fail('NOT_FOUND', 'Channel not found.', data));
     }
+
+    return res.status(200).json(ApiResponse.success(data));
+  } catch (error: any) {
     console.error('Error fetching channel data:', error.message);
+    if (error.message.includes('Cloudflare')) {
+        return res.status(403).json(ApiResponse.fail('FORBIDDEN', 'Request blocked by Cloudflare.', error.message));
+    }
     return res.status(502).json(ApiResponse.fail('BAD_GATEWAY', 'Failed to communicate with Kick API.', error.message));
   }
 }));
@@ -100,13 +136,18 @@ app.get('/api/kick/video/:id', asyncHandler(async (req: Request, res: Response) 
   }
 
   try {
-    const response = await axios.get(`https://kick.com/api/v1/video/${videoId}`);
-    return res.status(200).json(ApiResponse.success(response.data));
-  } catch (error: any) {
-    if (error.response && error.response.status === 404) {
-      return res.status(404).json(ApiResponse.fail('NOT_FOUND', 'Video not found.', error.response.data));
+    const data = await fetchKickApiWithPuppeteer(`https://kick.com/api/v1/video/${videoId}`);
+    
+    if (data && data.message && data.message.includes('not found')) {
+       return res.status(404).json(ApiResponse.fail('NOT_FOUND', 'Video not found.', data));
     }
+
+    return res.status(200).json(ApiResponse.success(data));
+  } catch (error: any) {
     console.error('Error fetching video data:', error.message);
+    if (error.message.includes('Cloudflare')) {
+        return res.status(403).json(ApiResponse.fail('FORBIDDEN', 'Request blocked by Cloudflare.', error.message));
+    }
     return res.status(502).json(ApiResponse.fail('BAD_GATEWAY', 'Failed to communicate with Kick API.', error.message));
   }
 }));
