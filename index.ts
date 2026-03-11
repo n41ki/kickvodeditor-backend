@@ -162,44 +162,49 @@ app.get('/api/kick/stream', asyncHandler(async (req: Request, res: Response) => 
        return res.status(400).send('Missing stream URL');
     }
 
-    let browser;
     try {
-        browser = await puppeteer.launch({
-            headless: true,
-            args: ['--no-sandbox', '--disable-setuid-sandbox']
-        });
-        const page = await browser.newPage();
-        await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
-        
-        // Setup an interceptor to hijack the response and pipe it to Express
-        page.on('response', async (response) => {
-            if (response.url() === streamUrl) {
-                try {
-                    const headers = response.headers();
-                    if (headers['content-type']) {
-                        res.setHeader('Content-Type', headers['content-type']);
-                    }
-                    res.setHeader('Access-Control-Allow-Origin', '*');
-                    
-                    const buffer = await response.buffer();
-                    res.send(buffer);
-                } catch (e) {
-                   console.error('Error extracting stream buffer', e);
-                   if (!res.headersSent) res.status(502).send('Buffer error');
-                }
+        const response = await axios({
+            method: 'GET',
+            url: streamUrl,
+            responseType: streamUrl.includes('.m3u8') ? 'text' : 'stream',
+            headers: {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                'Referer': 'https://kick.com',
             }
         });
 
-        await page.goto(streamUrl, { waitUntil: 'networkidle2', timeout: 30000 });
-        
-        // Let it process for a bit just in case
-        await new Promise(r => setTimeout(r, 1000));
+        res.setHeader('Access-Control-Allow-Origin', '*');
+        if (response.headers['content-type']) {
+            res.setHeader('Content-Type', response.headers['content-type']);
+        }
+
+        if (streamUrl.includes('.m3u8')) {
+            // Rewrite inner URLs to also pass through our proxy
+            let m3u8Content = response.data as string;
+            const baseUrl = streamUrl.substring(0, streamUrl.lastIndexOf('/') + 1);
+
+            const rewritten = m3u8Content.split('\n').map(line => {
+                if (line.startsWith('#') || line.trim() === '') return line;
+                
+                // If it's a relative URL, make it absolute
+                let targetUrl = line.trim();
+                if (!targetUrl.startsWith('http')) {
+                    targetUrl = baseUrl + targetUrl;
+                }
+                
+                // Wrap it in our proxy
+                return `/api/kick/stream?url=${encodeURIComponent(targetUrl)}`;
+            }).join('\n');
+
+            return res.send(rewritten);
+        } else {
+            // For .ts or .mp4 chunks, just pipe the stream
+            response.data.pipe(res);
+        }
 
     } catch (error: any) {
        console.error('[Stream Proxy Error]', error.message);
        if (!res.headersSent) res.status(502).send('Failed to proxy stream');
-    } finally {
-        if (browser) await browser.close();
     }
 }));
 
