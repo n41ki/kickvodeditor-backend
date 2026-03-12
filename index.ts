@@ -7,6 +7,7 @@ import path from 'path';
 import fs from 'fs';
 import puppeteer from 'puppeteer-extra';
 import StealthPlugin from 'puppeteer-extra-plugin-stealth';
+import jwt from 'jsonwebtoken';
 
 // Add stealth plugin to bypass Cloudflare
 puppeteer.use(StealthPlugin());
@@ -391,6 +392,84 @@ app.get('/api/clip/:id', (req: Request, res: Response) => {
 
     return res.status(200).json(ApiResponse.success(job));
 });
+
+// API Route: Secure Kick OAuth Token Exchange
+// @api-design-principles: Path renamed to avoid aggressive AdBlockers that block /auth or /token
+app.post(['/api/k-exchange', '/api/auth/kick/token', '/api/kick/token'], asyncHandler(async (req: Request, res: Response) => {
+    console.log(`[OAUTH_ATTEMPT] Body keys: ${Object.keys(req.body).join(', ')}`);
+    const { code, code_verifier, redirect_uri } = req.body;
+
+    if (!code || !code_verifier || !redirect_uri) {
+         return res.status(400).json(ApiResponse.fail('VALIDATION_ERROR', 'Missing required OAuth parameters.'));
+    }
+
+    const { KICK_CLIENT_ID, KICK_CLIENT_SECRET, SUPABASE_JWT_SECRET } = process.env;
+
+    if (!KICK_CLIENT_ID || !KICK_CLIENT_SECRET || !SUPABASE_JWT_SECRET) {
+         return res.status(500).json(ApiResponse.fail('SERVER_ERROR', 'Kick or Supabase credentials are not configured on the server.'));
+    }
+
+    try {
+        const response = await axios.post('https://id.kick.com/oauth/token', 
+            {
+               client_id: KICK_CLIENT_ID,
+               client_secret: KICK_CLIENT_SECRET,
+               code: code,
+               redirect_uri: redirect_uri,
+               grant_type: 'authorization_code',
+               code_verifier: code_verifier
+            },
+            {
+               headers: {
+                   'Content-Type': 'application/x-www-form-urlencoded',
+                   'Accept': 'application/json'
+               }
+            }
+        );
+
+        if (response.data && response.data.access_token) {
+            const accessToken = response.data.access_token;
+            
+            // 1. Get the User's Kick ID securely
+            const userResponse = await axios.get('https://api.kick.com/public/v1/users', {
+                headers: {
+                    'Authorization': `Bearer ${accessToken}`,
+                    'Accept': 'application/json'
+                }
+            });
+
+            // Note: The public v1 Kick API usually returns an array of users if searching, or the single user object. 
+            // Depending on Kick's exact endpoint structure for /user, we extract the ID.
+            const kickUserId = userResponse.data[0]?.user_id?.toString() || userResponse.data?.user_id?.toString() || userResponse.data?.id?.toString();
+
+            if (!kickUserId) {
+                console.error("Could not fetch User ID from Kick using the access token.", userResponse.data);
+                return res.status(500).json(ApiResponse.fail('AUTH_ERROR', 'Could not retrieve Kick user identity.'));
+            }
+
+            // 2. Mint Supabase Custom JWT Token matching the RLS scheme
+            const payload = {
+                 aud: 'authenticated',
+                 exp: Math.floor(Date.now() / 1000) + (60 * 60 * 24 * 7), // 7 days expiration mapping to our retention limit
+                 sub: kickUserId, 
+                 role: 'authenticated'
+            };
+
+            const supabaseToken = jwt.sign(payload, SUPABASE_JWT_SECRET);
+
+            return res.status(200).json(ApiResponse.success({
+                access_token: accessToken,
+                supabase_token: supabaseToken,
+                kick_user_id: kickUserId
+            }));
+        } else {
+            return res.status(401).json(ApiResponse.fail('UNAUTHORIZED', 'Failed to retrieve access token.', response.data));
+        }
+    } catch (error: any) {
+        console.error('[OAuth Token Error]', error.response?.data || error.message);
+        return res.status(error.response?.status || 500).json(ApiResponse.fail('OAUTH_ERROR', 'Token exchange failed.', error.response?.data || error.message));
+    }
+}));
 
 // Global Error Handler
 app.use((err: Error, req: Request, res: Response, next: NextFunction) => {
